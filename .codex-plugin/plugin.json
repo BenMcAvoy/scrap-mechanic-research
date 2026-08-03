@@ -1,6 +1,6 @@
 {
   "name": "scrap-mechanic-research",
-  "version": "0.1.0+codex.20260803112549",
+  "version": "0.1.0+codex.20260803112729",
   "description": "Scrap Mechanic reverse-engineering and mod-development assistant with project-specific IDA workflows and a Windows game-process MCP manager.",
   "author": {
     "name": "Ben"

@@ -1,0 +1,20 @@
+{
+  "name": "benmcavoy",
+  "interface": {
+    "displayName": "BenMcAvoy"
+  },
+  "plugins": [
+    {
+      "name": "scrap-mechanic-research",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/BenMcAvoy/scrap-mechanic-research.git"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
