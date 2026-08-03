@@ -1,0 +1,4 @@
+interface:
+  display_name: "Scrap Mechanic Game Messages"
+  short_description: "Resolve messages to tags and emitters"
+  default_prompt: "Find the native Scrap Mechanic code behind this player-visible message using English localization files and IDA Pro MCP."

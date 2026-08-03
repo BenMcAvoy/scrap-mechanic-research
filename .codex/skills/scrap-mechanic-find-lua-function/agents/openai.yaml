@@ -1,0 +1,4 @@
+interface:
+  display_name: "Scrap Mechanic: Find Lua Functions"
+  short_description: "Find native Lua bindings in IDA MCP"
+  default_prompt: "Use $scrap-mechanic-find-lua-function to locate and identify a Scrap Mechanic Lua function through its registration table and native implementation."

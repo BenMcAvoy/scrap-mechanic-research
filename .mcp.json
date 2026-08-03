@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "scrap-mechanic-manager": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--release",
+        "--manifest-path",
+        "scrap-mechanic-mcp/Cargo.toml"
+      ],
+      "cwd": "."
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "scrap-mechanic-research",
+  "version": "0.1.0",
+  "description": "Scrap Mechanic reverse-engineering and mod-development assistant with project-specific IDA workflows and a Windows game-process MCP manager.",
+  "author": {
+    "name": "Ben"
+  },
+  "homepage": "https://github.com/BenMcAvoy/scrap-mechanic-research",
+  "repository": "https://github.com/BenMcAvoy/scrap-mechanic-research.git",
+  "license": "MIT",
+  "keywords": [
+    "scrap-mechanic",
+    "reverse-engineering",
+    "modding",
+    "ida-pro",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Scrap Mechanic Research",
+    "shortDescription": "Scrap Mechanic RE tools and IDA workflows",
+    "longDescription": "Project-specific Scrap Mechanic reverse-engineering skills plus a Windows MCP manager for launching, monitoring, reading, and debugging the game during DLL mod development.",
+    "developerName": "Ben",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "MCP"
+    ],
+    "defaultPrompt": "Help me reverse engineer or develop a DLL mod for Scrap Mechanic using the project skills and MCP tools."
+  },
+  "mcpServers": "./.mcp.json"
+}

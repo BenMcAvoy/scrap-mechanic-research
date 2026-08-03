@@ -1,0 +1,4 @@
+interface:
+  display_name: "Scrap Mechanic: Find Globals"
+  short_description: "Find Scrap Mechanic globals with IDA MCP"
+  default_prompt: "Use $scrap-mechanic-find-global to locate and validate a Scrap Mechanic global in IDA Pro MCP."

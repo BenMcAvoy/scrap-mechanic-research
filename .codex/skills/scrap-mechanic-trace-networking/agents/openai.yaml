@@ -1,0 +1,4 @@
+interface:
+  display_name: "Scrap Mechanic: Trace Networking"
+  short_description: "Trace Scrap Mechanic RPC and replication"
+  default_prompt: "Use $scrap-mechanic-trace-networking to trace a Scrap Mechanic networked operation across client and server code."
