@@ -1,4 +1,0 @@
-interface:
-  display_name: "Scrap Mechanic IDA Research"
-  short_description: "Coordinate Scrap Mechanic IDA MCP methods"
-  default_prompt: "Use $scrap-mechanic-ida to choose and apply the right Scrap Mechanic reverse-engineering method through IDA Pro MCP."

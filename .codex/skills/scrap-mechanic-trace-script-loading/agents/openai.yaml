@@ -1,4 +1,0 @@
-interface:
-  display_name: "Scrap Mechanic: Trace Script Loading"
-  short_description: "Trace Scrap Mechanic Lua script loading"
-  default_prompt: "Use $scrap-mechanic-trace-script-loading to trace a Scrap Mechanic Lua script path into its loading and execution code."

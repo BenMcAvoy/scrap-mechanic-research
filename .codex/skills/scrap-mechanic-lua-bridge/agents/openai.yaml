@@ -1,4 +1,0 @@
-interface:
-  display_name: "Scrap Mechanic: Lua Bridge"
-  short_description: "Trace native objects through the Lua bridge"
-  default_prompt: "Use $scrap-mechanic-lua-bridge to trace how a Scrap Mechanic native object is represented and dispatched through Lua."

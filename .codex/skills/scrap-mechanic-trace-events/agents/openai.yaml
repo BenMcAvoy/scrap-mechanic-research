@@ -1,4 +1,0 @@
-interface:
-  display_name: "Scrap Mechanic: Trace Events"
-  short_description: "Trace Scrap Mechanic events and callbacks"
-  default_prompt: "Use $scrap-mechanic-trace-events to trace a Scrap Mechanic callback or event from registration to invocation."

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Scrap Mechanic: Trace Serialization"
-  short_description: "Trace Scrap Mechanic data serialization"
-  default_prompt: "Use $scrap-mechanic-trace-serialization to trace how a Scrap Mechanic object or Lua value is serialized and restored."

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Scrap Mechanic: Find Managers"
-  short_description: "Reverse engineer Scrap Mechanic managers"
-  default_prompt: "Use $scrap-mechanic-find-manager to locate a Scrap Mechanic manager, map its vtable, distinguish client or server variants, and analyze its member functions."
