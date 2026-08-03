@@ -101,8 +101,34 @@ async fn main() -> io::Result<()> {
 }
 
 async fn read_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
-    let mut headers = Vec::new();
     let mut byte = [0u8; 1];
+    if reader.read_exact(&mut byte).await.is_err() {
+        return Ok(None);
+    }
+
+    // Current MCP stdio uses one JSON-RPC object per newline-delimited line.
+    // Accept this in addition to the older Content-Length framing below.
+    if byte[0] == b'{' || byte[0] == b'[' {
+        let mut body = vec![byte[0]];
+        loop {
+            if reader.read_exact(&mut byte).await.is_err() {
+                break;
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
+            body.push(byte[0]);
+            if body.len() > 16 * 1024 * 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MCP message too large",
+                ));
+            }
+        }
+        return Ok(Some(body));
+    }
+
+    let mut headers = vec![byte[0]];
     loop {
         if reader.read_exact(&mut byte).await.is_err() {
             return Ok(None);
@@ -137,10 +163,8 @@ async fn read_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<Opt
 
 async fn write_response<W: AsyncWriteExt + Unpin>(writer: &mut W, value: Value) -> io::Result<()> {
     let body = serde_json::to_vec(&value).unwrap();
-    writer
-        .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
-        .await?;
     writer.write_all(&body).await?;
+    writer.write_all(b"\n").await?;
     writer.flush().await
 }
 
