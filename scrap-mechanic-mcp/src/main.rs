@@ -8,7 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -34,6 +34,12 @@ Autonomous iteration flow:
 Operational rules:
 - Always use absolute DLL paths and the PID returned by the MCP.
 - Treat a normal process exit, a crash, a debugger attach failure, and a timeout as different outcomes.
+- wait_for_event is an intentional blocking call. Do not repeatedly poll game_status or get_debug_events while it is pending; use its after_id and let it complete.
+- This server handles requests concurrently. After wait_for_event returns, get_debug_events, get_run_report, game_status, and stop_game may be called without waiting for another long-poll request to finish.
+- A wait timeout means no matching event was observed during that interval; it is not evidence that the game crashed. Inspect status and logs, then start one new wait with the latest event id.
+- Always pass after_id equal to the newest event id already observed. Do not reuse an old id, or the same historical event may be returned repeatedly.
+- If any MCP tool call remains silent for more than 60 seconds, do not start more polling calls. Treat the server as stale, restart Codex/MCP, and retry with the same PID only after confirming that the game is still running.
+- If the game is intentionally stopped by the debugger after an unhandled exception, use stop_game only to clear that known stale session; then relaunch and collect the new run's events and reports.
 - A minidump is strongest when paired with the event history, exception address/code, module list, and source/PDB files.
 - If no exception event is available, treat the exit event and generated report/log artifacts as the diagnostic result; fail-fast and external crash-reporting paths may not provide a stack.
 - After diagnosing a failure, make one focused code change, rebuild, and repeat the same runtime flow."#;
@@ -55,6 +61,8 @@ struct State {
     last_seen_pid: Option<u32>,
     next_event_id: u64,
     events: Vec<Event>,
+    event_generation: u64,
+    event_signal: Arc<Condvar>,
     breakpoints: HashMap<u32, Breakpoint>,
     supervised: HashSet<u32>,
     notification_tx: Option<mpsc::UnboundedSender<Value>>,
@@ -86,11 +94,25 @@ struct RpcRequest {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let (notification_tx, mut notification_rx) = mpsc::unbounded_channel();
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
     let state: SharedState = Arc::new(Mutex::new(State {
-        notification_tx: Some(notification_tx),
+        notification_tx: Some(output_tx.clone()),
         ..State::default()
     }));
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        loop {
+            match read_message(&mut stdin).await {
+                Ok(Some(body)) => {
+                    if request_tx.send(body).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    });
     #[cfg(target_os = "windows")]
     {
         let monitor_state = state.clone();
@@ -101,39 +123,42 @@ async fn main() -> io::Result<()> {
             }
         });
     }
-    let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     loop {
         tokio::select! {
-            notification = notification_rx.recv() => {
-                if let Some(value) = notification {
+            output = output_rx.recv() => {
+                if let Some(value) = output {
                     write_response(&mut stdout, value).await?;
                     continue;
                 }
             }
-            body = read_message(&mut stdin) => {
-                let Some(body) = body? else { break; };
-        let request: RpcRequest = match serde_json::from_slice(&body) {
-            Ok(value) => value,
-            Err(error) => {
-                write_response(&mut stdout, json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error.to_string()}})).await?;
-                continue;
-            }
-        };
-        let Some(id) = request.id.clone() else {
-            continue;
-        };
-        let response = match dispatch(
-            &state,
-            &request.method,
-            request.params.unwrap_or_else(|| json!({})),
-        )
-        .await
-        {
-            Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-            Err(error) => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error}}),
-        };
-        write_response(&mut stdout, response).await?;
+            body = request_rx.recv() => {
+                let Some(body) = body else { break; };
+                let request: RpcRequest = match serde_json::from_slice(&body) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        write_response(&mut stdout, json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error.to_string()}})).await?;
+                        continue;
+                    }
+                };
+                let Some(id) = request.id else {
+                    continue;
+                };
+                let request_state = state.clone();
+                let request_tx = output_tx.clone();
+                tokio::spawn(async move {
+                    let response = match dispatch(
+                        &request_state,
+                        &request.method,
+                        request.params.unwrap_or_else(|| json!({})),
+                    )
+                    .await
+                    {
+                        Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
+                        Err(error) => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error}}),
+                    };
+                    let _ = request_tx.send(response);
+                });
             }
         }
     }
@@ -223,12 +248,17 @@ async fn dispatch(state: &SharedState, method: &str, params: Value) -> Result<Va
             let name = params
                 .get("name")
                 .and_then(Value::as_str)
-                .ok_or("tools/call requires name")?;
+                .ok_or("tools/call requires name")?
+                .to_owned();
             let args = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match call_tool(state, name, args) {
+            let tool_state = state.clone();
+            let result = tokio::task::spawn_blocking(move || call_tool(&tool_state, &name, args))
+                .await
+                .map_err(|error| format!("tool task failed: {error}"))?;
+            match result {
                 Ok(value) => Ok(call_tool_result(value, false)),
                 Err(error) => Ok(call_tool_result(
                     json!({"error":{"category":"operation_failed","message":error,"retryable":false}}),
@@ -301,9 +331,10 @@ fn now() -> u64 {
 }
 fn event(state: &SharedState, kind: &str, pid: Option<u32>, detail: impl Into<String>) {
     let detail = detail.into();
-    let (event, tx) = {
+    let (event, tx, signal) = {
         let mut guard = state.lock().unwrap();
         guard.next_event_id += 1;
+        guard.event_generation = guard.event_generation.wrapping_add(1);
         let event = Event {
             id: guard.next_event_id,
             timestamp: now(),
@@ -317,8 +348,13 @@ fn event(state: &SharedState, kind: &str, pid: Option<u32>, detail: impl Into<St
             let excess = guard.events.len() - 512;
             guard.events.drain(0..excess);
         }
-        (event, guard.notification_tx.clone())
+        (
+            event,
+            guard.notification_tx.clone(),
+            guard.event_signal.clone(),
+        )
     };
+    signal.notify_all();
     let initialized = state
         .lock()
         .map(|guard| guard.client_initialized)
@@ -361,9 +397,9 @@ fn wait_for_event(state: &SharedState, args: Value) -> Result<Value, String> {
         .min(300_000);
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout);
     loop {
-        if let Some(event) = state
-            .lock()
-            .unwrap()
+        let signal = state.lock().unwrap().event_signal.clone();
+        let guard = state.lock().unwrap();
+        if let Some(event) = guard
             .events
             .iter()
             .find(|e| event_matches(e, &args))
@@ -371,10 +407,19 @@ fn wait_for_event(state: &SharedState, args: Value) -> Result<Value, String> {
         {
             return Ok(json!({"matched":true,"event":event}));
         }
-        if std::time::Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
             return Ok(json!({"matched":false,"timeout_ms":timeout}));
         }
-        thread::sleep(std::time::Duration::from_millis(50));
+        let generation = guard.event_generation;
+        let (_guard, result) = signal
+            .wait_timeout_while(guard, remaining, |current| {
+                current.event_generation == generation
+            })
+            .map_err(|_| "event wait lock poisoned")?;
+        if result.timed_out() {
+            return Ok(json!({"matched":false,"timeout_ms":timeout}));
+        }
     }
 }
 
