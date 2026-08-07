@@ -58,6 +58,7 @@ struct State {
     breakpoints: HashMap<u32, Breakpoint>,
     supervised: HashSet<u32>,
     notification_tx: Option<mpsc::UnboundedSender<Value>>,
+    client_initialized: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -210,9 +211,12 @@ async fn write_response<W: AsyncWriteExt + Unpin>(writer: &mut W, value: Value) 
 
 async fn dispatch(state: &SharedState, method: &str, params: Value) -> Result<Value, String> {
     match method {
-        "initialize" => Ok(
-            json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{},"logging":{}},"serverInfo":{"name":"scrap-mechanic-mcp","version":"0.2.0"},"instructions":SERVER_INSTRUCTIONS}),
-        ),
+        "initialize" => {
+            state.lock().unwrap().client_initialized = true;
+            Ok(
+                json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{},"logging":{}},"serverInfo":{"name":"scrap-mechanic-mcp","version":"0.2.0"},"instructions":SERVER_INSTRUCTIONS}),
+            )
+        }
         "notifications/initialized" => Ok(json!({})),
         "tools/list" => Ok(tool_list()),
         "tools/call" => {
@@ -315,12 +319,18 @@ fn event(state: &SharedState, kind: &str, pid: Option<u32>, detail: impl Into<St
         }
         (event, guard.notification_tx.clone())
     };
-    if let Some(tx) = tx {
-        let _ = tx.send(json!({
-            "jsonrpc":"2.0",
-            "method":"notifications/message",
-            "params":{"level":"info","logger":"scrap-mechanic-mcp","data":event}
-        }));
+    let initialized = state
+        .lock()
+        .map(|guard| guard.client_initialized)
+        .unwrap_or(false);
+    if initialized {
+        if let Some(tx) = tx {
+            let _ = tx.send(json!({
+                "jsonrpc":"2.0",
+                "method":"notifications/message",
+                "params":{"level":"info","logger":"scrap-mechanic-mcp","data":event}
+            }));
+        }
     }
 }
 
@@ -766,7 +776,13 @@ fn inject_dll(state: &SharedState, args: Value) -> Result<Value, String> {
         .get("dll")
         .and_then(Value::as_str)
         .ok_or("dll is required")?;
-    let path = std::fs::canonicalize(dll).map_err(|e| format!("dll path is invalid: {e}"))?;
+    let path = PathBuf::from(dll);
+    if !path.is_absolute() {
+        return Err("dll must be an absolute Windows path".into());
+    }
+    if !path.is_file() {
+        return Err(format!("dll does not exist: {}", path.display()));
+    }
     let pid = args
         .get("pid")
         .and_then(Value::as_u64)
@@ -787,31 +803,32 @@ fn inject_dll(state: &SharedState, args: Value) -> Result<Value, String> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    let byte_len = wide.len() * std::mem::size_of::<u16>();
     unsafe {
         let remote = VirtualAllocEx(
             target,
             None,
-            wide.len(),
+            byte_len,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE,
         );
         if remote.is_null() {
             return Err("VirtualAllocEx failed".into());
         }
+        let mut keep_remote_allocation = false;
         let result = (|| {
             let mut written = 0;
             WriteProcessMemory(
                 target,
                 remote,
                 wide.as_ptr() as *const _,
-                wide.len(),
+                byte_len,
                 Some(&mut written),
             )
             .map_err(|e| format!("WriteProcessMemory failed: {e}"))?;
-            if written != wide.len() {
+            if written != byte_len {
                 return Err(format!(
-                    "WriteProcessMemory wrote {written} of {} bytes",
-                    wide.len()
+                    "WriteProcessMemory wrote {written} of {byte_len} bytes"
                 ));
             }
             let kernel_name: Vec<u16> = "kernel32.dll"
@@ -828,7 +845,16 @@ fn inject_dll(state: &SharedState, args: Value) -> Result<Value, String> {
                 .map_err(|e| format!("CreateRemoteThread failed: {e}"))?;
             let wait = WaitForSingleObject(thread, timeout);
             if wait != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                keep_remote_allocation = true;
+                let loaded = module_info(pid, path.to_str().unwrap_or_default());
                 let _ = windows::Win32::Foundation::CloseHandle(thread);
+                if let Some((base, _)) = loaded {
+                    return Ok((
+                        base,
+                        false,
+                        format!("loader did not finish: 0x{:08X}", wait.0),
+                    ));
+                }
                 return Err(format!(
                     "remote loader timed out or failed: 0x{:08X}",
                     wait.0
@@ -841,19 +867,24 @@ fn inject_dll(state: &SharedState, args: Value) -> Result<Value, String> {
             if module == 0 {
                 return Err("LoadLibraryW returned failure".into());
             }
-            Ok(module as u64)
+            Ok((module as u64, true, "loader completed".to_string()))
         })();
-        let _ = VirtualFreeEx(target, remote, 0, MEM_RELEASE);
+        if !keep_remote_allocation {
+            let _ = VirtualFreeEx(target, remote, 0, MEM_RELEASE);
+        }
         let _ = windows::Win32::Foundation::CloseHandle(target);
-        let module = result?;
+        let (module, loader_completed, loader_status) = result?;
         event(
             state,
             "dll_injected",
             Some(pid),
-            format!("{} base=0x{module:X}", path.display()),
+            format!(
+                "{} base=0x{module:X} loader={loader_status}",
+                path.display()
+            ),
         );
         Ok(
-            json!({"injected":true,"pid":pid,"dll":path,"module_base":format!("0x{module:X}"),"timeout_ms":timeout}),
+            json!({"injected":true,"pid":pid,"dll":path,"module_base":format!("0x{module:X}"),"timeout_ms":timeout,"loader_completed":loader_completed,"loader_status":loader_status,"remote_path_retained":keep_remote_allocation}),
         )
     }
 }
