@@ -24,11 +24,11 @@ const SERVER_INSTRUCTIONS: &str = r#"You are controlling a local Scrap Mechanic 
 
 Autonomous iteration flow:
 1. Inspect the workspace and build the DLL with the project's existing build system. Do not assume the DLL path; verify the produced artifact.
-2. Call launch_game when Scrap Mechanic is not running. Use keep_graphics=true only when visual rendering is required; otherwise prefer the default null-driver mode.
-3. Call inject with the absolute DLL path. The MCP is configured for local development and has no approval gate for injection, memory writes, or unloading. Still validate the target PID and artifact before acting.
-4. After launch or injection, call wait_for_event with an appropriate timeout. Prefer this over client-side polling. The Codex harness may not wake the agent from unsolicited notifications, but it will receive the result of a blocking wait_for_event call.
-5. On process_crash, debug_dump_ready, crash_report_ready, or debug_exception, call get_run_report and get_debug_events, then inspect the referenced dump, text report, game logs, and DLL logs before changing code.
-6. For a clean iteration, call uninject with the DLL module name/path and its cleanup export when the DLL supports one, then rebuild and inject the next artifact. Never force-unload a DLL without a cleanup export.
+2. For autonomous DLL testing, prefer run_iteration. It establishes an event baseline, launches or adopts the game, retries injection while the game becomes ready, observes broadly for crashes, collects artifacts, checks success signals, and returns a classified result.
+3. Use launch_game/inject/wait_for_event separately for reverse engineering or when the iteration requires manual control. Always use absolute DLL paths and the PID returned by the MCP.
+4. Configure success.file or success.log_pattern when the task has a concrete success marker. Without one, healthy observation is not proof that the DLL achieved its task.
+5. On process_crash, process_exit, debug_dump_ready, crash_report_ready, debug_exception, or debug_supervisor_error, call get_run_report and inspect the referenced dump, text report, game logs, and DLL logs before changing code.
+6. For a clean manual iteration, call uninject with the DLL module name/path and its cleanup export when the DLL supports one, then rebuild and inject the next artifact. Never force-unload a DLL without a cleanup export.
 7. Use read_memory, write_memory, and hardware breakpoints only when the current investigation requires them. Record addresses, module bases, and observed events in the iteration reasoning.
 
 Operational rules:
@@ -40,6 +40,9 @@ Operational rules:
 - Always pass after_id equal to the newest event id already observed. Do not reuse an old id, or the same historical event may be returned repeatedly.
 - If any MCP tool call remains silent for more than 60 seconds, do not start more polling calls. Treat the server as stale, restart Codex/MCP, and retry with the same PID only after confirming that the game is still running.
 - If the game is intentionally stopped by the debugger after an unhandled exception, use stop_game only to clear that known stale session; then relaunch and collect the new run's events and reports.
+- Automatic recovery is enabled by default only for processes launched by this MCP. Do not terminate a game that was already running before the iteration unless explicitly instructed.
+- A second-chance exception emits process_crash before dump capture. Dump capture is bounded; inspect debug_dump_ready or debug_dump_error, then use the terminal result rather than waiting indefinitely.
+- Bugsplat is an artifact source, not a supervisor dependency. Never wait for Bugsplat UI activity or attach the supervisor to Bugsplat.
 - A minidump is strongest when paired with the event history, exception address/code, module list, and source/PDB files.
 - If no exception event is available, treat the exit event and generated report/log artifacts as the diagnostic result; fail-fast and external crash-reporting paths may not provide a stack.
 - After diagnosing a failure, make one focused code change, rebuild, and repeat the same runtime flow."#;
@@ -48,9 +51,24 @@ Operational rules:
 struct Event {
     id: u64,
     timestamp: u64,
+    session_id: Option<String>,
+    source: String,
     kind: String,
     pid: Option<u32>,
     detail: String,
+    report: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RunSession {
+    id: String,
+    pid: Option<u32>,
+    dll: Option<String>,
+    manager_owned: bool,
+    baseline_event_id: u64,
+    phase: String,
+    terminal: bool,
+    outcome: Option<String>,
     report: Option<String>,
 }
 
@@ -61,6 +79,9 @@ struct State {
     last_seen_pid: Option<u32>,
     next_event_id: u64,
     events: Vec<Event>,
+    sessions: HashMap<String, RunSession>,
+    active_session: Option<String>,
+    next_session_id: u64,
     event_generation: u64,
     event_signal: Arc<Condvar>,
     breakpoints: HashMap<u32, Breakpoint>,
@@ -292,7 +313,9 @@ fn tool_list() -> Value {
         tool("set_hardware_breakpoint", "Set a Windows hardware breakpoint on the target process and record debugger hits.", json!({"type":"object","required":["address"],"properties":{"pid":{"type":"integer"},"address":{"type":"integer"},"access":{"type":"string","enum":["execute","write","readwrite"]},"length":{"type":"integer","enum":[1,2,4,8]}}})),
         tool("clear_hardware_breakpoint", "Remove a previously configured hardware breakpoint.", json!({"type":"object","required":["id"],"properties":{"id":{"type":"integer"}}})),
         tool("get_debug_events", "Return process lifecycle and hardware-breakpoint hit events.", json!({"type":"object","properties":{"clear":{"type":"boolean"}}})),
-        tool("wait_for_event", "Wait for a matching lifecycle or debugger event without client-side polling.", json!({"type":"object","properties":{"kind":{"type":"string"},"pid":{"type":"integer"},"after_id":{"type":"integer"},"timeout_ms":{"type":"integer","maximum":300000}}})),
+        tool("wait_for_event", "Wait for matching lifecycle or debugger events without client-side polling.", json!({"type":"object","properties":{"kind":{"type":"string"},"kinds":{"type":"array","items":{"type":"string"}},"pid":{"type":"integer"},"after_id":{"type":"integer"},"timeout_ms":{"type":"integer","maximum":300000}}})),
+        tool("get_event_cursor", "Return the current event cursor and active run session.", json!({"type":"object","properties":{}})),
+        tool("run_iteration", "Run one autonomous DLL runtime iteration with readiness retries, crash detection, artifact collection, success signals, and bounded recovery.", json!({"type":"object","required":["dll"],"properties":{"dll":{"type":"string"},"pid":{"type":"integer"},"keep_graphics":{"type":"boolean"},"args":{"type":"array","items":{"type":"string"}},"readiness_timeout_ms":{"type":"integer"},"observation_timeout_ms":{"type":"integer"},"inject_timeout_ms":{"type":"integer"},"recovery":{"type":"boolean"},"max_attempts":{"type":"integer"},"success":{"type":"object","properties":{"file":{"type":"string"},"log_pattern":{"type":"string"},"timeout_ms":{"type":"integer"}}}}})),
         tool("get_run_report", "Return the latest crash report and diagnostic artifact paths.", json!({"type":"object","properties":{"pid":{"type":"integer"}}}))
     ]})
 }
@@ -317,6 +340,8 @@ fn call_tool(state: &SharedState, name: &str, args: Value) -> Result<Value, Stri
             "clear_hardware_breakpoint" => clear_breakpoint(state, args),
             "get_debug_events" => get_events(state, args),
             "wait_for_event" => wait_for_event(state, args),
+            "get_event_cursor" => get_event_cursor(state),
+            "run_iteration" => run_iteration(state, args),
             "get_run_report" => get_run_report(state, args),
             _ => Err(format!("Unknown tool: {name}")),
         }
@@ -330,6 +355,27 @@ fn now() -> u64 {
         .as_secs()
 }
 fn event(state: &SharedState, kind: &str, pid: Option<u32>, detail: impl Into<String>) {
+    event_from(state, "runtime", kind, pid, detail);
+}
+
+fn event_from(
+    state: &SharedState,
+    source: &str,
+    kind: &str,
+    pid: Option<u32>,
+    detail: impl Into<String>,
+) {
+    event_for_session(state, source, kind, pid, detail, None);
+}
+
+fn event_for_session(
+    state: &SharedState,
+    source: &str,
+    kind: &str,
+    pid: Option<u32>,
+    detail: impl Into<String>,
+    session_id: Option<&str>,
+) {
     let detail = detail.into();
     let (event, tx, signal) = {
         let mut guard = state.lock().unwrap();
@@ -338,6 +384,10 @@ fn event(state: &SharedState, kind: &str, pid: Option<u32>, detail: impl Into<St
         let event = Event {
             id: guard.next_event_id,
             timestamp: now(),
+            session_id: session_id
+                .map(str::to_owned)
+                .or_else(|| guard.active_session.clone()),
+            source: source.into(),
             kind: kind.into(),
             pid,
             detail,
@@ -371,9 +421,22 @@ fn event(state: &SharedState, kind: &str, pid: Option<u32>, detail: impl Into<St
 }
 
 fn event_matches(event: &Event, args: &Value) -> bool {
-    if let Some(kind) = args.get("kind").and_then(Value::as_str)
-        && event.kind != kind
-    {
+    let kind_matches = args
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(|kind| event.kind == kind)
+        .unwrap_or(true);
+    let kinds_matches = args
+        .get("kinds")
+        .and_then(Value::as_array)
+        .map(|kinds| {
+            kinds
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|kind| kind == event.kind)
+        })
+        .unwrap_or(true);
+    if !kind_matches || !kinds_matches {
         return false;
     }
     if let Some(pid) = args.get("pid").and_then(Value::as_u64)
@@ -387,6 +450,15 @@ fn event_matches(event: &Event, args: &Value) -> bool {
         return false;
     }
     true
+}
+
+fn get_event_cursor(state: &SharedState) -> Result<Value, String> {
+    let guard = state.lock().map_err(|_| "state lock poisoned")?;
+    Ok(json!({
+        "event_id": guard.next_event_id,
+        "active_session": guard.active_session.as_ref().and_then(|id| guard.sessions.get(id)),
+        "events_retained": guard.events.len()
+    }))
 }
 
 fn wait_for_event(state: &SharedState, args: Value) -> Result<Value, String> {
@@ -421,6 +493,317 @@ fn wait_for_event(state: &SharedState, args: Value) -> Result<Value, String> {
             return Ok(json!({"matched":false,"timeout_ms":timeout}));
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn run_iteration(state: &SharedState, args: Value) -> Result<Value, String> {
+    let dll = args
+        .get("dll")
+        .and_then(Value::as_str)
+        .ok_or("dll is required")?;
+    let dll_path = PathBuf::from(dll);
+    if !dll_path.is_absolute() || !dll_path.is_file() {
+        return Err(format!(
+            "dll must be an existing absolute path: {}",
+            dll_path.display()
+        ));
+    }
+    let recovery = args
+        .get("recovery")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let max_attempts = args
+        .get("max_attempts")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .clamp(1, 10) as usize;
+    let observation_timeout = args
+        .get("observation_timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000)
+        .clamp(100, 300_000);
+    let readiness_timeout = args
+        .get("readiness_timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(60_000)
+        .clamp(1_000, 300_000);
+    let inject_timeout = args
+        .get("inject_timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(15_000);
+    let success = args.get("success").cloned().unwrap_or_else(|| json!({}));
+    let mut attempts = Vec::new();
+
+    for attempt in 1..=max_attempts {
+        let (session_id, baseline, existing_pid) = {
+            let mut guard = state.lock().map_err(|_| "state lock poisoned")?;
+            guard.next_session_id += 1;
+            let id = format!("run-{}-{}", now(), guard.next_session_id);
+            let baseline = guard.next_event_id;
+            let existing_pid = args
+                .get("pid")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32)
+                .or_else(find_pid);
+            guard.sessions.insert(
+                id.clone(),
+                RunSession {
+                    id: id.clone(),
+                    pid: existing_pid,
+                    dll: Some(dll_path.display().to_string()),
+                    manager_owned: existing_pid.is_none(),
+                    baseline_event_id: baseline,
+                    phase: "created".into(),
+                    terminal: false,
+                    outcome: None,
+                    report: None,
+                },
+            );
+            guard.active_session = Some(id.clone());
+            (id, baseline, existing_pid)
+        };
+
+        let manager_owned = existing_pid.is_none();
+        let pid = if let Some(pid) = existing_pid {
+            pid
+        } else {
+            let mut launch_args = args.clone();
+            if let Some(object) = launch_args.as_object_mut() {
+                object.remove("dll");
+                object.remove("pid");
+                object.remove("recovery");
+                object.remove("max_attempts");
+                object.remove("observation_timeout_ms");
+                object.remove("inject_timeout_ms");
+                object.remove("success");
+            }
+            let launched = launch_game(state, launch_args)?;
+            launched
+                .get("pid")
+                .and_then(Value::as_u64)
+                .ok_or("launch did not return a PID")? as u32
+        };
+        update_session(state, &session_id, |session| {
+            session.pid = Some(pid);
+            session.phase = "launched".into();
+            session.manager_owned = manager_owned;
+        });
+        let _ = game_status(state);
+
+        let inject_args = json!({
+            "dll": dll_path,
+            "pid": pid,
+            "timeout_ms": inject_timeout
+        });
+        let injection = match inject_with_readiness(
+            state,
+            inject_args,
+            pid,
+            dll_path.to_str().unwrap_or_default(),
+            readiness_timeout,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                update_session(state, &session_id, |session| {
+                    session.phase = "terminal".into();
+                    session.terminal = true;
+                    session.outcome = Some("inject_failed".into());
+                });
+                let report = write_session_report(state, &session_id, "inject_failed");
+                update_session(state, &session_id, |session| {
+                    session.report = report.clone()
+                });
+                attempts.push(json!({"attempt":attempt,"session_id":session_id,"outcome":"inject_failed","error":error,"report":report}));
+                if recovery && manager_owned && attempt < max_attempts {
+                    let _ = stop_game(state, json!({"pid":pid}));
+                    thread::sleep(std::time::Duration::from_secs(1));
+                    continue;
+                }
+                return Ok(json!({"outcome":"inject_failed","attempts":attempts}));
+            }
+        };
+        update_session(state, &session_id, |session| {
+            session.phase = "observing".into()
+        });
+        let observation = observe_iteration(state, pid, baseline, observation_timeout, &success);
+        let outcome = observation
+            .get("outcome")
+            .and_then(Value::as_str)
+            .unwrap_or("uncertain")
+            .to_string();
+        let terminal = outcome != "healthy_observation" && outcome != "success";
+        update_session(state, &session_id, |session| {
+            session.phase = "terminal".into();
+            session.terminal = true;
+            session.outcome = Some(outcome.clone());
+        });
+        let report = write_session_report(state, &session_id, &outcome);
+        update_session(state, &session_id, |session| {
+            session.report = report.clone()
+        });
+        attempts.push(json!({"attempt":attempt,"session_id":session_id,"outcome":outcome,"injection":injection,"observation":observation,"report":report}));
+        if !terminal || !recovery || !manager_owned || attempt == max_attempts {
+            return Ok(json!({"outcome":outcome,"attempts":attempts}));
+        }
+        let _ = stop_game(state, json!({"pid":pid}));
+        thread::sleep(std::time::Duration::from_secs(1));
+        let _ = game_status(state);
+    }
+    Ok(json!({"outcome":"recovery_failed","attempts":attempts}))
+}
+
+#[cfg(target_os = "windows")]
+fn inject_with_readiness(
+    state: &SharedState,
+    args: Value,
+    pid: u32,
+    dll: &str,
+    timeout_ms: u64,
+) -> Result<Value, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        match inject_dll(state, args.clone()) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if module_info(pid, dll).is_some() {
+                    return Ok(json!({
+                        "injected": true,
+                        "pid": pid,
+                        "dll": dll,
+                        "loader_completed": false,
+                        "loader_status": "module already loaded",
+                        "module_base": module_info(pid, dll).map(|(base, _)| format!("0x{base:X}"))
+                    }));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!("{error} (readiness timeout {timeout_ms} ms)"));
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "game did not become injection-ready (readiness timeout {timeout_ms} ms)"
+            ));
+        }
+        thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn update_session(state: &SharedState, id: &str, update: impl FnOnce(&mut RunSession)) {
+    if let Ok(mut guard) = state.lock() {
+        if let Some(session) = guard.sessions.get_mut(id) {
+            update(session);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn observe_iteration(
+    state: &SharedState,
+    pid: u32,
+    baseline: u64,
+    timeout_ms: u64,
+    success: &Value,
+) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let crash_kinds = json!([
+        "process_crash",
+        "process_exit",
+        "debug_exception",
+        "debug_dump_ready",
+        "crash_report_ready",
+        "debug_supervisor_error"
+    ]);
+    let mut cursor = baseline;
+    loop {
+        if success_signal_observed(success) {
+            event(
+                state,
+                "iteration_success",
+                Some(pid),
+                "configured success signal observed",
+            );
+            return json!({"outcome":"success","event_id":cursor});
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return json!({"outcome":if success.as_object().is_some_and(|v| !v.is_empty()) { "success_signal_timeout" } else { "healthy_observation" },"event_id":cursor});
+        }
+        let wait_ms = remaining.as_millis().min(500) as u64;
+        let mut wait_args =
+            json!({"pid":pid,"after_id":cursor,"kinds":crash_kinds,"timeout_ms":wait_ms});
+        if let Some(object) = wait_args.as_object_mut() {
+            object.insert("kinds".into(), crash_kinds.clone());
+        }
+        if let Ok(result) = wait_for_event(state, wait_args) {
+            if result.get("matched").and_then(Value::as_bool) == Some(true) {
+                if let Some(id) = result.pointer("/event/id").and_then(Value::as_u64) {
+                    cursor = id;
+                }
+                let kind = result
+                    .pointer("/event/kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("uncertain");
+                if kind == "debug_exception"
+                    && result
+                        .pointer("/event/detail")
+                        .and_then(Value::as_str)
+                        .is_some_and(|detail| detail.contains("first_chance=1"))
+                {
+                    continue;
+                }
+                let artifact_event = if kind == "process_crash" || kind == "debug_exception" {
+                    wait_for_event(
+                        state,
+                        json!({
+                            "pid": pid,
+                            "after_id": cursor,
+                            "kinds": ["debug_dump_ready", "debug_dump_error", "crash_report_ready"],
+                            "timeout_ms": 10_000
+                        }),
+                    )
+                    .ok()
+                } else {
+                    None
+                };
+                let outcome = if kind == "process_exit" {
+                    "process_exit"
+                } else if kind == "debug_supervisor_error" {
+                    "debugger_attach_failed"
+                } else {
+                    "process_crash"
+                };
+                return json!({"outcome":outcome,"event":result.get("event"),"artifact_event":artifact_event,"event_id":cursor});
+            }
+        }
+        if find_pid() != Some(pid) {
+            let _ = game_status(state);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn success_signal_observed(success: &Value) -> bool {
+    let Some(object) = success.as_object() else {
+        return false;
+    };
+    if let Some(path) = object.get("file").and_then(Value::as_str) {
+        if PathBuf::from(path).is_file() {
+            return true;
+        }
+    }
+    if let Some(pattern) = object.get("log_pattern").and_then(Value::as_str) {
+        if let Some(log) = latest_game_log() {
+            if std::fs::read_to_string(log)
+                .map(|text| text.contains(pattern))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(target_os = "windows")]
@@ -472,6 +855,69 @@ fn write_crash_report(state: &SharedState, pid: u32, code: Option<u32>) -> Optio
 }
 
 #[cfg(target_os = "windows")]
+fn latest_game_log() -> Option<PathBuf> {
+    let logs = game_root().join("Logs");
+    std::fs::read_dir(logs)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|value| value.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("game-") && name.ends_with(".log"))
+        })
+        .max_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn write_session_report(state: &SharedState, session_id: &str, outcome: &str) -> Option<String> {
+    let session = state.lock().ok()?.sessions.get(session_id).cloned()?;
+    let events = state
+        .lock()
+        .ok()?
+        .events
+        .iter()
+        .filter(|event| event.session_id.as_deref() == Some(session_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let root = report_root().join(session_id);
+    std::fs::create_dir_all(&root).ok()?;
+    let pid = session.pid.unwrap_or(0);
+    let temp_artifacts = std::env::var_os("TEMP")
+        .map(PathBuf::from)
+        .map(|temp| {
+            std::fs::read_dir(temp)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    (name.contains(&format!("-{pid}-"))
+                        && (name.ends_with(".dmp") || name.ends_with(".txt")))
+                    .then(|| entry.path().display().to_string())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let report = json!({
+        "session": session,
+        "outcome": outcome,
+        "captured_at": now(),
+        "events": events,
+        "game_log": latest_game_log(),
+        "crash_artifacts": temp_artifacts,
+        "note": "This report combines MCP lifecycle/debugger evidence with artifacts emitted by the game or injected DLL."
+    });
+    let path = root.join("report.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&report).ok()?).ok()?;
+    Some(path.display().to_string())
+}
+
+#[cfg(target_os = "windows")]
 fn write_debug_minidump(
     pid: u32,
     exception_code: u32,
@@ -510,7 +956,23 @@ fn write_debug_minidump(
 }
 
 #[cfg(target_os = "windows")]
-fn debug_supervisor(state: SharedState, pid: u32) {
+fn write_debug_minidump_bounded(
+    pid: u32,
+    exception_code: u32,
+    exception_address: usize,
+    timeout: std::time::Duration,
+) -> Result<Option<PathBuf>, String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(write_debug_minidump(pid, exception_code, exception_address));
+    });
+    receiver
+        .recv_timeout(timeout)
+        .map_err(|_| format!("minidump timed out after {} ms", timeout.as_millis()))
+}
+
+#[cfg(target_os = "windows")]
+fn debug_supervisor(state: SharedState, pid: u32, session_id: Option<String>) {
     use windows::Win32::Foundation::{DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED};
     use windows::Win32::System::Diagnostics::Debug::{
         ContinueDebugEvent, DEBUG_EVENT, DebugActiveProcess, EXCEPTION_DEBUG_EVENT,
@@ -518,19 +980,23 @@ fn debug_supervisor(state: SharedState, pid: u32) {
     };
     unsafe {
         if let Err(error) = DebugActiveProcess(pid) {
-            event(
+            event_for_session(
                 &state,
+                "debug_supervisor",
                 "debug_supervisor_error",
                 Some(pid),
                 format!("DebugActiveProcess failed: {error}"),
+                session_id.as_deref(),
             );
             return;
         }
-        event(
+        event_for_session(
             &state,
+            "debug_supervisor",
             "debug_supervisor_attached",
             Some(pid),
             "external debugger attached",
+            session_id.as_deref(),
         );
         loop {
             let mut debug_event = DEBUG_EVENT::default();
@@ -546,39 +1012,67 @@ fn debug_supervisor(state: SharedState, pid: u32) {
                 let record = info.ExceptionRecord;
                 let code = record.ExceptionCode.0 as u32;
                 let address = record.ExceptionAddress as usize;
-                event(
+                event_for_session(
                     &state,
+                    "debug_supervisor",
                     "debug_exception",
                     Some(pid),
                     format!(
                         "code=0x{code:08X} address=0x{address:X} first_chance={}",
                         info.dwFirstChance
                     ),
+                    session_id.as_deref(),
                 );
                 if info.dwFirstChance == 0 {
-                    if let Some(path) = write_debug_minidump(pid, code, address) {
-                        event(
+                    event_for_session(
+                        &state,
+                        "debug_supervisor",
+                        "process_crash",
+                        Some(pid),
+                        format!("second-chance exception code=0x{code:08X} address=0x{address:X}"),
+                        session_id.as_deref(),
+                    );
+                    match write_debug_minidump_bounded(
+                        pid,
+                        code,
+                        address,
+                        std::time::Duration::from_secs(10),
+                    ) {
+                        Ok(Some(path)) => event_for_session(
                             &state,
+                            "debug_supervisor",
                             "debug_dump_ready",
                             Some(pid),
                             path.display().to_string(),
-                        );
-                    } else {
-                        event(
+                            session_id.as_deref(),
+                        ),
+                        Ok(None) => event_for_session(
                             &state,
+                            "debug_supervisor",
                             "debug_dump_error",
                             Some(pid),
                             "MiniDumpWriteDump failed",
-                        );
+                            session_id.as_deref(),
+                        ),
+                        Err(error) => event_for_session(
+                            &state,
+                            "debug_supervisor",
+                            "debug_dump_error",
+                            Some(pid),
+                            error,
+                            session_id.as_deref(),
+                        ),
                     }
                     continue_status = DBG_EXCEPTION_NOT_HANDLED;
                 }
             } else if debug_event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT {
-                event(
+                event_for_session(
                     &state,
+                    "debug_supervisor",
                     "debug_process_exit",
                     Some(pid),
                     "debug supervisor observed process exit",
+                    session_id.as_deref(),
                 );
             }
             let _ = ContinueDebugEvent(
@@ -597,13 +1091,16 @@ fn debug_supervisor(state: SharedState, pid: u32) {
 #[cfg(target_os = "windows")]
 fn get_run_report(state: &SharedState, args: Value) -> Result<Value, String> {
     let pid = args.get("pid").and_then(Value::as_u64).map(|v| v as u32);
-    let events = state
-        .lock()
-        .map_err(|_| "state lock poisoned")?
-        .events
-        .clone();
+    let guard = state.lock().map_err(|_| "state lock poisoned")?;
+    let sessions = guard
+        .sessions
+        .values()
+        .filter(|session| pid.is_none() || session.pid == pid)
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = guard.events.clone();
     let selected = events.iter().rev().find(|e| pid.is_none() || e.pid == pid);
-    Ok(json!({"latest_event":selected,"reports_root":report_root()}))
+    Ok(json!({"latest_event":selected,"sessions":sessions,"reports_root":report_root()}))
 }
 
 #[cfg(target_os = "windows")]
@@ -691,13 +1188,14 @@ fn game_status(state: &SharedState) -> Result<Value, String> {
         event(state, "process_start", pid, "ScrapMechanic.exe detected");
     }
     if let Some(pid) = pid {
-        let start_supervisor = {
+        let (start_supervisor, session_id) = {
             let mut guard = state.lock().unwrap();
-            guard.supervised.insert(pid)
+            let start = guard.supervised.insert(pid);
+            (start, guard.active_session.clone())
         };
         if start_supervisor {
             let supervisor_state = state.clone();
-            thread::spawn(move || debug_supervisor(supervisor_state, pid));
+            thread::spawn(move || debug_supervisor(supervisor_state, pid, session_id));
         }
     }
     {
@@ -1384,4 +1882,37 @@ fn get_events(state: &SharedState, args: Value) -> Result<Value, String> {
         guard.events.clear();
     }
     Ok(json!({"events":events,"breakpoints":guard.breakpoints.values().collect::<Vec<_>>() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(kind: &str, id: u64) -> Event {
+        Event {
+            id,
+            timestamp: 0,
+            session_id: Some("run-test".into()),
+            source: "test".into(),
+            kind: kind.into(),
+            pid: Some(42),
+            detail: String::new(),
+            report: None,
+        }
+    }
+
+    #[test]
+    fn event_kind_array_matches_crash_family() {
+        let value = json!({"kinds":["process_crash","debug_dump_ready"],"after_id":2,"pid":42});
+        assert!(event_matches(&event("debug_dump_ready", 3), &value));
+        assert!(!event_matches(&event("process_start", 3), &value));
+        assert!(!event_matches(&event("debug_dump_ready", 2), &value));
+    }
+
+    #[test]
+    fn singular_kind_remains_compatible() {
+        let value = json!({"kind":"process_exit","pid":42});
+        assert!(event_matches(&event("process_exit", 1), &value));
+        assert!(!event_matches(&event("process_crash", 1), &value));
+    }
 }
