@@ -1,0 +1,8 @@
+# Public directory used by the in-game server browser.
+directory_url = "http://127.0.0.1:8080"
+
+# REST refresh interval. The server list is applied on the game thread.
+refresh_seconds = 5
+
+# Number of native MyGUI server buttons to create.
+max_servers = 8

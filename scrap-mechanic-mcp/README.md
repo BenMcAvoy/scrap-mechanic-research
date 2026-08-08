@@ -28,6 +28,8 @@ Point the MCP client at the built executable using its absolute path:
 
 The server includes an MCP `initialize.instructions` playbook for agent clients. It describes the autonomous build, launch, injection, event-waiting, crash-diagnosis, unload, and iteration flow. Codex clients should use `wait_for_event` for reliable blocking notification behavior.
 
+Use `read_log` after a crash, exception, injection failure, or unexpected behavior. It reads the most recently modified regular file under the game's `Logs` directory and returns its path, truncation status, and contents. The installation root is discovered from Steam's library folders when possible; set `SCRAP_MECHANIC_ROOT` to override it explicitly. The tool returns up to 4 MiB by default and accepts an optional `max_bytes` up to 16 MiB.
+
 For autonomous DLL testing, use `run_iteration` instead of manually polling. It creates a run session, records an event baseline, retries injection while the game becomes ready, observes process/debugger/artifact events concurrently, checks optional `success.file` or `success.log_pattern` markers, writes a full report, and can recover manager-launched processes. Use `get_event_cursor` plus `wait_for_event` with `after_id` when driving the lower-level tools.
 
 - Finds an already-running `ScrapMechanic.exe` and attaches to it without relaunching or changing graphics.

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<MyGUI type="Layout" version="3.2.0">
+    <Widget type="Widget" skin="PanelEmpty" name="DedicatedHelpersPanel" position_real="0.270000 0.120000 0.460000 0.760000">
+        <Property key="NeedKey" value="false" />
+        <Widget type="TextBox" skin="TextBox" name="Title" position_real="0.080000 0.050000 0.840000 0.100000">
+            <Property key="Caption" value="Dedicated Servers" />
+            <Property key="TextAlign" value="Center" />
+        </Widget>
+    </Widget>
+    <CodeGeneratorSettings />
+</MyGUI>

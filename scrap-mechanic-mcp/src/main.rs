@@ -45,6 +45,7 @@ Operational rules:
 - Bugsplat is an artifact source, not a supervisor dependency. Never wait for Bugsplat UI activity or attach the supervisor to Bugsplat.
 - A minidump is strongest when paired with the event history, exception address/code, module list, and source/PDB files.
 - If no exception event is available, treat the exit event and generated report/log artifacts as the diagnostic result; fail-fast and external crash-reporting paths may not provide a stack.
+- After a crash, exception, injection failure, or unexpected behavior, call read_log to read the most recently modified regular file in Scrap Mechanic's Logs directory. The tool discovers the Steam library installation when possible; set SCRAP_MECHANIC_ROOT if discovery needs an explicit override.
 - After diagnosing a failure, make one focused code change, rebuild, and repeat the same runtime flow."#;
 
 #[derive(Clone, Debug, Serialize)]
@@ -316,7 +317,8 @@ fn tool_list() -> Value {
         tool("wait_for_event", "Wait for matching lifecycle or debugger events without client-side polling.", json!({"type":"object","properties":{"kind":{"type":"string"},"kinds":{"type":"array","items":{"type":"string"}},"pid":{"type":"integer"},"after_id":{"type":"integer"},"timeout_ms":{"type":"integer","maximum":300000}}})),
         tool("get_event_cursor", "Return the current event cursor and active run session.", json!({"type":"object","properties":{}})),
         tool("run_iteration", "Run one autonomous DLL runtime iteration with readiness retries, crash detection, artifact collection, success signals, and bounded recovery.", json!({"type":"object","required":["dll"],"properties":{"dll":{"type":"string"},"pid":{"type":"integer"},"keep_graphics":{"type":"boolean"},"args":{"type":"array","items":{"type":"string"}},"readiness_timeout_ms":{"type":"integer"},"observation_timeout_ms":{"type":"integer"},"inject_timeout_ms":{"type":"integer"},"recovery":{"type":"boolean"},"max_attempts":{"type":"integer"},"success":{"type":"object","properties":{"file":{"type":"string"},"log_pattern":{"type":"string"},"timeout_ms":{"type":"integer"}}}}})),
-        tool("get_run_report", "Return the latest crash report and diagnostic artifact paths.", json!({"type":"object","properties":{"pid":{"type":"integer"}}}))
+        tool("get_run_report", "Return the latest crash report and diagnostic artifact paths.", json!({"type":"object","properties":{"pid":{"type":"integer"}}})),
+        tool("read_log", "Read the most recently modified regular file in Scrap Mechanic's Logs directory. Uses Steam library discovery when possible; set SCRAP_MECHANIC_ROOT to override the installation root.", json!({"type":"object","properties":{"max_bytes":{"type":"integer","minimum":1,"maximum":16777216,"description":"Maximum bytes to return; defaults to 4194304."}}}))
     ]})
 }
 
@@ -343,6 +345,7 @@ fn call_tool(state: &SharedState, name: &str, args: Value) -> Result<Value, Stri
             "get_event_cursor" => get_event_cursor(state),
             "run_iteration" => run_iteration(state, args),
             "get_run_report" => get_run_report(state, args),
+            "read_log" => read_latest_log(args),
             _ => Err(format!("Unknown tool: {name}")),
         }
     }
@@ -860,16 +863,44 @@ fn latest_game_log() -> Option<PathBuf> {
     std::fs::read_dir(logs)
         .ok()?
         .filter_map(|entry| entry.ok().map(|value| value.path()))
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("game-") && name.ends_with(".log"))
-        })
+        .filter(|path| path.is_file())
         .max_by_key(|path| {
             std::fs::metadata(path)
                 .and_then(|meta| meta.modified())
                 .ok()
         })
+}
+
+#[cfg(target_os = "windows")]
+fn read_latest_log(args: Value) -> Result<Value, String> {
+    use std::io::Read;
+
+    let max_bytes = args
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(4 * 1024 * 1024);
+    if !(1..=16 * 1024 * 1024).contains(&max_bytes) {
+        return Err("max_bytes must be between 1 and 16777216".into());
+    }
+    let logs_directory = game_root().join("Logs");
+    let path = latest_game_log()
+        .ok_or_else(|| format!("No regular files found in {}", logs_directory.display()))?;
+    let mut file = std::fs::File::open(&path)
+        .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity(max_bytes as usize + 1);
+    file.by_ref()
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let truncated = bytes.len() > max_bytes as usize;
+    bytes.truncate(max_bytes as usize);
+    Ok(json!({
+        "path": path,
+        "logs_directory": logs_directory,
+        "bytes": bytes.len(),
+        "truncated": truncated,
+        "content": String::from_utf8_lossy(&bytes)
+    }))
 }
 
 #[cfg(target_os = "windows")]
@@ -1105,7 +1136,45 @@ fn get_run_report(state: &SharedState, args: Value) -> Result<Value, String> {
 
 #[cfg(target_os = "windows")]
 fn game_root() -> PathBuf {
-    PathBuf::from(DEFAULT_ROOT)
+    if let Some(root) = std::env::var_os("SCRAP_MECHANIC_ROOT") {
+        let root = PathBuf::from(root);
+        if root.is_dir() {
+            return root;
+        }
+    }
+
+    let mut steam_roots = Vec::new();
+    for variable in ["PROGRAMFILES(X86)", "PROGRAMFILES"] {
+        if let Some(program_files) = std::env::var_os(variable) {
+            steam_roots.push(PathBuf::from(program_files).join("Steam"));
+        }
+    }
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        steam_roots.push(PathBuf::from(local_app_data).join("Steam"));
+    }
+
+    let mut libraries = Vec::new();
+    for steam in &steam_roots {
+        let library_file = steam.join("steamapps").join("libraryfolders.vdf");
+        if let Ok(contents) = std::fs::read_to_string(library_file) {
+            for line in contents.lines().filter(|line| line.contains("\"path\"")) {
+                if let Some(value) = line.split('"').nth(3) {
+                    libraries.push(PathBuf::from(value.replace("\\\\", "\\")));
+                }
+            }
+        }
+    }
+    libraries.extend(steam_roots);
+    libraries
+        .into_iter()
+        .map(|library| {
+            library
+                .join("steamapps")
+                .join("common")
+                .join("Scrap Mechanic")
+        })
+        .find(|path| path.join("Release").join(EXE_NAME).is_file() || path.join("Logs").is_dir())
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT))
 }
 
 #[cfg(target_os = "windows")]

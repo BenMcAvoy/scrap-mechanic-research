@@ -1,2 +1,23 @@
 plugin-staging/
 scrap-mechanic-mcp/target/
+
+# Local build outputs, game/runtime artifacts, and reverse-engineering databases
+**/target/
+**/bin/
+**/obj/
+**/build/
+**/build*/
+.target-*/
+.xmake/
+.external/
+Logs/
+reports/
+temp_steam_probe/
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.exe
+*.zip

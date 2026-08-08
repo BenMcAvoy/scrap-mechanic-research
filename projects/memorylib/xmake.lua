@@ -1,0 +1,15 @@
+set_project("memorylib")
+set_version("0.1.0")
+set_languages("c++20")
+set_toolchains("clang-cl")
+
+add_requires("minhook", "zydis 4.1.1")
+
+target("memorylib")
+    set_kind("static")
+    add_files("src/memorylib.cpp")
+    add_packages("minhook", "zydis")
+    add_includedirs("include", {public = true})
+    add_defines("WIN32_LEAN_AND_MEAN", "NOMINMAX", "UNICODE", "_UNICODE")
+    add_cxxflags("/EHsc", "/W4", "/permissive-")
+    add_syslinks("kernel32")
